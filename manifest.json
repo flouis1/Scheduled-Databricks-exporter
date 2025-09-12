@@ -1,17 +1,31 @@
 {
     "name": "databricks-exporter",
-    "description": "Run a script on SCHEDULED_EVENT",
+    "description": "Generic worker that makes configurable API calls and optionally exports data to Databricks",
+    "secrets": {
+        "DATABRICKS_URL": "Databricks workspace URL",
+        "DATABRICKS_TOKEN": "Databricks personal access token", 
+        "DATABRICKS_WAREHOUSE_ID": "Databricks SQL warehouse ID"
+    },
+    "properties": {
+        "apiEndpoint": "/runtime/api/v1/images/tags",
+        "httpMethod": "POST",
+        "queryParams": "{\"limit\": \"100\"}",
+        "databricksTableName": "jfrog_workload_data",
+        "dataProperty": "tags",
+        "databricksAutoCreateTable": "true",
+        "databricksCatalog": "main",
+        "databricksSchema": "default"
+    },
     "filterCriteria": {
         "schedule": {
-            "cron": "0 * * * *",
+            "cron": "0 */6 * * *",
             "timezone": "UTC"
         }
     },
-    "secrets": {},
     "sourceCodePath": "./worker.ts",
     "action": "SCHEDULED_EVENT",
-    "enabled": false,
-    "debug": false,
+    "enabled": true,
+    "debug": true,
     "projectKey": "",
     "application": "worker"
 }

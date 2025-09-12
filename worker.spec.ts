@@ -1,19 +1,11 @@
-import { PlatformContext, PlatformClients, PlatformHttpClient } from 'jfrog-workers';
 import { createMock, DeepMocked } from '@golevelup/ts-jest';
 import runWorker from './worker';
-import { ScheduledEventRequest } from './types';
-
-// Mock fetch globally
-global.fetch = jest.fn();
+import { PlatformContext, ScheduledEventRequest } from './types';
 
 describe("databricks-exporter tests", () => {
     let context: any;
-    let mockFetch: jest.MockedFunction<typeof fetch>;
 
     beforeEach(() => {
-        mockFetch = fetch as jest.MockedFunction<typeof fetch>;
-        mockFetch.mockClear();
-
         context = {
             clients: {
                 platformHttp: {
@@ -21,26 +13,30 @@ describe("databricks-exporter tests", () => {
                     post: jest.fn(),
                     put: jest.fn(),
                     delete: jest.fn(),
+                },
+                axios: {
+                    post: jest.fn()
                 }
             },
             properties: {
                 get: jest.fn((key: string) => {
-                    const props = {
-                        apiEndpoint: "/runtime/api/v1/images/tags",
-                        httpMethod: "GET",
-                        queryParams: '{"limit": "100"}',
-                        databricksTableName: "runtime_images",
-                        dataProperty: "tags"
+                    const props: Record<string, string> = {
+                   apiEndpoint: "/runtime/api/v1/images/tags",
+                   httpMethod: "GET",
+                   queryParams: '{"limit": "100"}',
+                   databricksTableName: "runtime_images",
+                   dataProperty: "tags",
+                   databricksAutoCreateTable: "true",
+                   databricksCatalog: "main",
+                   databricksSchema: "default"
                     };
                     return props[key];
                 })
+            },
+            secrets: {
+                get: jest.fn(() => undefined)
             }
         };
-
-        // Clear environment variables
-        delete process.env.DATABRICKS_URL;
-        delete process.env.DATABRICKS_TOKEN;
-        delete process.env.DATABRICKS_WAREHOUSE_ID;
     });
 
     afterEach(() => {
@@ -57,15 +53,15 @@ describe("databricks-exporter tests", () => {
                 ]
             };
 
-            context.clients.platformHttp.get.mockResolvedValue({
+            (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
                 data: mockApiResponse
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
-            expect(result.apiResponse).toEqual(mockApiResponse);
+            expect(result.message).toContain('Successfully processed');
+            expect(result.message).toContain('/runtime/api/v1/images/tags');
             expect(context.clients.platformHttp.get).toHaveBeenCalledWith(
                 "/runtime/api/v1/images/tags?limit=100",
                 { headers: {} }
@@ -75,7 +71,7 @@ describe("databricks-exporter tests", () => {
         it('should make a successful GET request to workloads API', async () => {
             // Override properties for workloads API
             context.properties.get = jest.fn((key: string) => {
-                const props = {
+                const props: Record<string, string> = {
                     apiEndpoint: "/runtime/api/v1/workloads",
                     httpMethod: "GET",
                     queryParams: '{"namespace": "default"}',
@@ -93,15 +89,15 @@ describe("databricks-exporter tests", () => {
                 ]
             };
 
-            context.clients.platformHttp.get.mockResolvedValue({
+            (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
                 data: mockApiResponse
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
-            expect(result.apiResponse).toEqual(mockApiResponse);
+            expect(result.message).toContain('Successfully processed');
+            expect(result.message).toContain('/runtime/api/v1/workloads');
             expect(context.clients.platformHttp.get).toHaveBeenCalledWith(
                 "/runtime/api/v1/workloads?namespace=default",
                 { headers: {} }
@@ -110,161 +106,244 @@ describe("databricks-exporter tests", () => {
 
         it('should handle API errors gracefully', async () => {
             context.properties.get = jest.fn((key: string) => {
-                if (key === 'apiEndpoint') return "/invalid/endpoint";
-                return undefined;
+                const props: Record<string, string> = {
+                    apiEndpoint: "/invalid/endpoint",
+                    httpMethod: "GET",
+                    queryParams: '',
+                    databricksTableName: "",
+                    dataProperty: ""
+                };
+                return props[key];
             });
 
             const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
 
             (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 404,
-                statusText: "Not Found"
+                statusText: "Not Found",
+                data: {}
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(false);
-            expect(result.error).toContain("API request returned status 404");
+            expect(result.message).toContain('SCHEDULED_EVENT failed');
+            expect(result.message).toContain('API request returned status 404');
         });
 
         it('should handle missing apiEndpoint property', async () => {
             context.properties.get = jest.fn((key: string) => {
-                return undefined;
+                const props: Record<string, string> = {
+                    httpMethod: "GET",
+                    queryParams: '',
+                    databricksTableName: "",
+                    dataProperty: ""
+                };
+                return props[key] || '';
             });
 
             const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
 
-            await expect(runWorker(context, payload)).rejects.toThrow(
-                'apiEndpoint property is required in worker configuration'
-            );
+            const result = await runWorker(context, payload);
+
+            expect(result.message).toContain('SCHEDULED_EVENT failed');
+            expect(result.message).toContain('apiEndpoint property is required');
         });
     });
 
     describe("Databricks integration", () => {
-        beforeEach(() => {
-            process.env.DATABRICKS_URL = "https://test.databricks.com";
-            process.env.DATABRICKS_TOKEN = "test-token";
-        });
-
         it('should send data to Databricks when configured', async () => {
             const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
 
             const mockApiResponse = {
-                tags: [{ tag: "latest", digest: "sha256:abc123" }]
+                tags: [
+                    { tag: "latest", digest: "sha256:abc123" }
+                ]
             };
 
-            context.clients.platformHttp.get.mockResolvedValue({
+            (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
                 data: mockApiResponse
             });
 
-            mockFetch.mockResolvedValueOnce({
-                ok: true,
-                json: () => Promise.resolve({ statement_id: "stmt-123" })
-            } as Response);
+            // Set Databricks secrets via context.secrets.get()
+            (context.secrets.get as jest.Mock).mockImplementation((key: string) => {
+                const secrets: Record<string, string> = {
+                    DATABRICKS_URL: "https://test.databricks.com",
+                    DATABRICKS_TOKEN: "test-token",
+                    DATABRICKS_WAREHOUSE_ID: "test-warehouse"
+                };
+                return secrets[key];
+            });
+
+            // Mock successful Databricks response
+            (context.clients.axios.post as jest.Mock).mockResolvedValue({
+                data: {
+                    statement_id: "stmt-123"
+                }
+            });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
-            expect(result.databricksResult).toEqual({
-                recordCount: 1,
-                statementId: "stmt-123"
-            });
-            expect(mockFetch).toHaveBeenCalledWith(
+            expect(result.message).toContain('Successfully processed');
+            expect(result.message).toContain('sent to Databricks table runtime_images');
+            expect(context.clients.axios.post).toHaveBeenCalledWith(
                 "https://test.databricks.com/api/2.0/sql/statements",
                 expect.objectContaining({
-                    method: "POST",
-                    headers: {
-                        "Authorization": "Bearer test-token",
-                        "Content-Type": "application/json"
-                    }
+                    statement: expect.any(String),
+                    warehouse_id: "test-warehouse"
+                }),
+                expect.objectContaining({
+                    headers: expect.objectContaining({
+                        "Authorization": "Bearer test-token"
+                    })
                 })
             );
         });
 
         it('should skip Databricks when not configured', async () => {
-            delete process.env.DATABRICKS_URL;
-            
-            // Remove databricks config from properties
-            context.properties.get = jest.fn((key: string) => {
-                if (key === 'apiEndpoint') return "/test/api";
-                return undefined;
-            });
-
             const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
+
+            const mockApiResponse = {
+                tags: [{ tag: "latest" }]
+            };
 
             (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
-                data: [{ id: 1 }]
+                data: mockApiResponse
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
-            expect(result.databricksResult).toBeUndefined();
-            expect(mockFetch).not.toHaveBeenCalled();
+            expect(result.message).toContain('Successfully processed');
+            expect(result.message).not.toContain('sent to Databricks');
+            expect(context.clients.axios.post).not.toHaveBeenCalled();
         });
 
         it('should fail when Databricks URL is set but token is missing', async () => {
-            delete process.env.DATABRICKS_TOKEN;
-
             const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
 
             (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
-                data: [{ id: 1 }]
+                data: { tags: [] }
+            });
+
+            // Set URL but not token via context.secrets.get()
+            (context.secrets.get as jest.Mock).mockImplementation((key: string) => {
+                if (key === 'DATABRICKS_URL') return "https://test.databricks.com";
+                return undefined; // No DATABRICKS_TOKEN
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(false);
-            expect(result.error).toContain("DATABRICKS_TOKEN is required");
+            expect(result.message).toContain('SCHEDULED_EVENT failed');
+            expect(result.message).toContain('DATABRICKS_TOKEN is required');
         });
     });
 
     describe("data extraction", () => {
         it('should extract nested data using dataProperty', async () => {
             context.properties.get = jest.fn((key: string) => {
-                const props = {
+                const props: Record<string, string> = {
                     apiEndpoint: "/test/api",
+                    httpMethod: "GET",
+                    queryParams: '',
                     databricksTableName: "test_table",
                     dataProperty: "data.items"
                 };
                 return props[key];
             });
 
-            const apiResponse = {
+            const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
+
+            const mockApiResponse = {
+                status: "success",
                 data: {
-                    items: [{ id: 1 }, { id: 2 }]
+                    items: [
+                        { id: 1, name: "item1" },
+                        { id: 2, name: "item2" }
+                    ]
                 }
             };
 
-            process.env.DATABRICKS_URL = "https://test.databricks.com";
-            process.env.DATABRICKS_TOKEN = "test-token";
-
-            const payload: ScheduledEventRequest = { triggerID: 'test-trigger-2' };
-
             (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
-                data: apiResponse
+                data: mockApiResponse
             });
 
-            mockFetch.mockResolvedValueOnce({
-                ok: true,
-                json: () => Promise.resolve({ statement_id: "stmt-123" })
-            } as Response);
+            // Set Databricks secrets via context.secrets.get()
+            (context.secrets.get as jest.Mock).mockImplementation((key: string) => {
+                const secrets: Record<string, string> = {
+                    DATABRICKS_URL: "https://test.databricks.com",
+                    DATABRICKS_TOKEN: "test-token"
+                };
+                return secrets[key];
+            });
+
+            (context.clients.axios.post as jest.Mock).mockResolvedValue({
+                data: {
+                    statement_id: "stmt-123"
+                }
+            });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
-            expect(result.databricksResult?.recordCount).toBe(2);
+            expect(result.message).toContain('Successfully processed');
+            expect(result.message).toContain('sent to Databricks table test_table');
+        });
+
+        it("should create table automatically when enabled", async () => {
+            const payload: ScheduledEventRequest = { triggerID: "test-trigger-auto-create" };
+            const mockApiResponse = { tags: [{ name: "latest", digest: "sha256:test" }] };
+
+            // Mock successful API response
+            (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
+                status: 200,
+                data: mockApiResponse
+            });
+
+            // Set Databricks secrets with auto-create enabled
+            (context.secrets.get as jest.Mock).mockImplementation((key: string) => {
+                const secrets: Record<string, string> = {
+                    DATABRICKS_URL: "https://test.databricks.com",
+                    DATABRICKS_TOKEN: "test-token",
+                    DATABRICKS_WAREHOUSE_ID: "test-warehouse"
+                };
+                return secrets[key];
+            });
+
+            // Mock successful table creation and data insertion
+            (context.clients.axios.post as jest.Mock)
+                .mockResolvedValueOnce({ data: { statement_id: "create-stmt-123" } }) // Table creation
+                .mockResolvedValueOnce({ data: { statement_id: "insert-stmt-456" } }); // Data insertion
+
+            const result = await runWorker(context, payload);
+
+            expect(result.message).toContain('Successfully processed 1 records');
+            expect(context.clients.axios.post).toHaveBeenCalledTimes(2); // Table creation + data insertion
+            
+            // Verify table creation call
+            expect(context.clients.axios.post).toHaveBeenNthCalledWith(1,
+                "https://test.databricks.com/api/2.0/sql/statements",
+                expect.objectContaining({
+                    statement: expect.stringContaining("CREATE TABLE IF NOT EXISTS main.default.runtime_images"),
+                    warehouse_id: "test-warehouse"
+                }),
+                expect.objectContaining({
+                    headers: expect.objectContaining({
+                        'Authorization': 'Bearer test-token'
+                    })
+                })
+            );
         });
 
         it('should handle invalid JSON in queryParams gracefully', async () => {
             context.properties.get = jest.fn((key: string) => {
-                const props = {
+                const props: Record<string, string> = {
                     apiEndpoint: "/test/api",
-                    queryParams: "invalid json"
+                    httpMethod: "GET",
+                    queryParams: 'invalid json',
+                    databricksTableName: "",
+                    dataProperty: ""
                 };
                 return props[key];
             });
@@ -273,12 +352,12 @@ describe("databricks-exporter tests", () => {
 
             (context.clients.platformHttp.get as jest.Mock).mockResolvedValue({
                 status: 200,
-                data: { result: "ok" }
+                data: { result: "success" }
             });
 
             const result = await runWorker(context, payload);
 
-            expect(result.success).toBe(true);
+            expect(result.message).toContain('Successfully processed');
             expect(context.clients.platformHttp.get).toHaveBeenCalledWith(
                 "/test/api",
                 { headers: {} }

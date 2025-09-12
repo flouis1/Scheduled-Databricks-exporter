@@ -81,3 +81,5 @@ worker.js.map
 tmp/
 temp/
 .tmp/
+
+*.sh

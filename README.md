@@ -63,6 +63,9 @@ This worker provides a scheduled automation solution for:
 | `requestBody` | No | JSON string of request body for POST/PUT | `'{"query": "items.find()"}'` |
 | `databricksTableName` | No | Databricks table name for data export | `runtime_images` |
 | `dataProperty` | No | Data extraction path (dot notation) | `tags`, `data.items` |
+| `databricksAutoCreateTable` | No | Auto-create table if not exists (`"true"` or `"false"`) | `"false"` |
+| `databricksCatalog` | No | Databricks catalog name | `"main"` |
+| `databricksSchema` | No | Databricks schema/database name | `"default"` |
 
 ### Environment Variables (Secrets)
 
@@ -397,5 +400,43 @@ Monitor worker execution through JFrog Platform logs. Each execution will show:
   "cron": "0 */2 * * *"
 }
 ```
+
+## 🔧 Automatic Table Creation
+
+When `databricksAutoCreateTable` is set to `"true"`, the worker automatically creates tables with this optimized schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{tableName} (
+  timestamp STRING,
+  data_json STRING,
+  processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
+) USING DELTA
+TBLPROPERTIES (
+  'delta.autoOptimize.optimizeWrite' = 'true',
+  'delta.autoOptimize.autoCompact' = 'true'
+)
+```
+
+**Benefits:**
+- ✅ **No manual table creation** required
+- ✅ **Delta Lake format** for ACID transactions  
+- ✅ **Auto-optimization** for better performance
+- ✅ **Consistent schema** across all tables
+
+**Usage:**
+```json
+{
+  "properties": {
+    "databricksTableName": "jfrog_runtime_data",
+    "databricksAutoCreateTable": "true",
+    "databricksCatalog": "main",
+    "databricksSchema": "bronze_layer"
+  }
+}
+```
+
+This will create the table `main.bronze_layer.jfrog_runtime_data` in your Databricks workspace.
+
+---
 
 This SCHEDULED_EVENT worker provides maximum flexibility for automatically integrating any JFrog Platform API with your data analytics pipeline on a scheduled basis.

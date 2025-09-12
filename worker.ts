@@ -1,10 +1,9 @@
-import { PlatformContext } from 'jfrog-workers';
-import { ScheduledEventRequest, ScheduledEventResponse } from './types';
+import { PlatformContext, ScheduledEventRequest, ScheduledEventResponse } from './types';
 
 interface DatabricksConfig {
   url: string;
   token: string;
-  warehouseId?: string;
+  warehouseId: string;
 }
 
 class DatabricksClient {
@@ -14,40 +13,83 @@ class DatabricksClient {
     this.config = config;
   }
 
-  async sendData(data: any[], tableName: string, timestamp: string): Promise<{ recordCount: number; statementId?: string }> {
+  async createTableIfNotExists(tableName: string, catalog: string, schema: string, axiosClient: any): Promise<void> {
+    try {
+      // Construire le nom de table (complet ou simple selon la configuration)
+      const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
+      const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
+      
+      const createTableStatement = `
+        CREATE TABLE IF NOT EXISTS ${finalTableName} (
+          timestamp STRING,
+          data_json STRING,
+          processed_at TIMESTAMP
+        ) USING DELTA
+        TBLPROPERTIES (
+          'delta.autoOptimize.optimizeWrite' = 'true',
+          'delta.autoOptimize.autoCompact' = 'true'
+        )
+      `;
+
+      console.log(`Creating table if not exists: ${finalTableName}${useFullName ? ` (catalog: ${catalog}, schema: ${schema})` : ' (using default schema)'}`);
+      
+      const response = await axiosClient.post(`${this.config.url}/api/2.0/sql/statements`, {
+        statement: createTableStatement,
+        warehouse_id: this.config.warehouseId
+      }, {
+        headers: {
+          'Authorization': `Bearer ${this.config.token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      console.log(`Table creation statement executed for ${finalTableName}`, {
+        statementId: response.data.statement_id,
+        useFullName,
+        catalog: useFullName ? catalog : 'default',
+        schema: useFullName ? schema : 'default',
+        tableName
+      });
+    } catch (error) {
+      const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
+      const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
+      console.error(`Failed to create table ${finalTableName}:`, error);
+      throw error;
+    }
+  }
+
+  async sendData(data: any[], tableName: string, timestamp: string, axiosClient: any, autoCreateTable: boolean = false, catalog: string = 'main', schema: string = 'default'): Promise<{ recordCount: number; statementId?: string }> {
     if (!data || data.length === 0) {
       console.log('No data to send to Databricks');
       return { recordCount: 0 };
     }
 
     try {
-      const statement = this.buildInsertStatement(data, tableName, timestamp);
+      // Create table if auto-create is enabled
+      if (autoCreateTable) {
+        await this.createTableIfNotExists(tableName, catalog, schema, axiosClient);
+      }
       
-      const response = await fetch(`${this.config.url}/api/2.0/sql/statements`, {
-        method: 'POST',
+      const statement = this.buildInsertStatement(data, tableName, timestamp, catalog, schema);
+      
+      const response = await axiosClient.post(`${this.config.url}/api/2.0/sql/statements`, {
+        statement,
+        warehouse_id: this.config.warehouseId
+      }, {
         headers: {
           'Authorization': `Bearer ${this.config.token}`,
           'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          statement,
-          warehouse_id: this.config.warehouseId || 'default'
-        })
+        }
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const result = await response.json();
       console.log(`Data successfully sent to Databricks table ${tableName}`, {
-        statementId: result.statement_id,
+        statementId: response.data.statement_id,
         recordCount: data.length
       });
 
       return {
         recordCount: data.length,
-        statementId: result.statement_id
+        statementId: response.data.statement_id
       };
     } catch (error) {
       console.error('Failed to send data to Databricks:', error);
@@ -55,18 +97,23 @@ class DatabricksClient {
     }
   }
 
-  private buildInsertStatement(data: any[], tableName: string, timestamp: string): string {
+  private buildInsertStatement(data: any[], tableName: string, timestamp: string, catalog: string = 'main', schema: string = 'default'): string {
     // Create a flexible insert statement that can handle any JSON structure
     const values = data.map(item => {
       const jsonData = typeof item === 'string' ? item : JSON.stringify(item);
       const escapedJson = jsonData.replace(/'/g, "''");
-      return `('${timestamp}', '${escapedJson}')`;
+      return `('${timestamp}', '${escapedJson}', CURRENT_TIMESTAMP())`;
     }).join(', ');
 
+    // Construire le nom de table (complet ou simple selon la configuration)
+    const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
+    const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
+
     return `
-      INSERT INTO ${tableName} (
+      INSERT INTO ${finalTableName} (
         timestamp,
-        data_json
+        data_json,
+        processed_at
       ) VALUES ${values}
     `;
   }
@@ -160,8 +207,11 @@ export default async (
     const queryParamsStr = getProperty('queryParams', '');
     const headersStr = getProperty('headers', '');
     const requestBodyStr = getProperty('requestBody', '');
-    const databricksTableName = getProperty('databricksTableName');
-    const dataProperty = getProperty('dataProperty');
+     const databricksTableName = getProperty('databricksTableName');
+     const dataProperty = getProperty('dataProperty');
+     const autoCreateTable = getProperty('databricksAutoCreateTable', 'false') === 'true';
+     const databricksCatalog = getProperty('databricksCatalog', 'main');
+     const databricksSchema = getProperty('databricksSchema', 'default');
     
     // Log loaded properties
     console.log('Worker properties loaded:', {
@@ -169,7 +219,10 @@ export default async (
       httpMethod,
       queryParamsStr: queryParamsStr ? 'configured' : 'empty',
       databricksTableName,
-      dataProperty
+      dataProperty,
+      autoCreateTable,
+      databricksCatalog,
+      databricksSchema
     });
     
     if (!apiEndpoint) {
@@ -218,8 +271,10 @@ export default async (
 
       // Send to Databricks if configured
       if (databricksTableName) {
-        const databricksUrl = process.env.DATABRICKS_URL;
-        const databricksToken = process.env.DATABRICKS_TOKEN;
+        // Access secrets through official JFrog Workers API
+        const databricksUrl = context.secrets.get('DATABRICKS_URL');
+        const databricksToken = context.secrets.get('DATABRICKS_TOKEN');
+        const databricksWarehouseId = context.secrets.get('DATABRICKS_WAREHOUSE_ID');
 
         if (!databricksUrl) {
           console.log('DATABRICKS_URL not configured, skipping Databricks integration');
@@ -231,7 +286,7 @@ export default async (
           const databricksClient = new DatabricksClient({
             url: databricksUrl,
             token: databricksToken,
-            warehouseId: process.env.DATABRICKS_WAREHOUSE_ID
+            warehouseId: databricksWarehouseId
           });
 
           const dataToSend = extractDataFromResponse(
@@ -242,7 +297,11 @@ export default async (
           const result = await databricksClient.sendData(
             dataToSend,
             databricksTableName,
-            timestamp
+            timestamp,
+            context.clients.axios,
+            autoCreateTable,
+            databricksCatalog,
+            databricksSchema
           );
 
           const executionTime = Date.now() - startTime;
