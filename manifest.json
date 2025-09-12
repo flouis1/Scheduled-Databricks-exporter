@@ -1,0 +1,17 @@
+{
+    "name": "databricks-exporter",
+    "description": "Run a script on SCHEDULED_EVENT",
+    "filterCriteria": {
+        "schedule": {
+            "cron": "0 * * * *",
+            "timezone": "UTC"
+        }
+    },
+    "secrets": {},
+    "sourceCodePath": "./worker.ts",
+    "action": "SCHEDULED_EVENT",
+    "enabled": false,
+    "debug": false,
+    "projectKey": "",
+    "application": "worker"
+}
