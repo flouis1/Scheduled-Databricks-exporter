@@ -13,8 +13,9 @@
         "databricksTableName": "jfrog_workload_data",
         "dataProperty": "tags",
         "databricksAutoCreateTable": "true",
-        "databricksCatalog": "main",
-        "databricksSchema": "default"
+        "databricksCatalog": "solengeu",
+        "databricksSchema": "default",
+        "databricksMode": "append"
     },
     "filterCriteria": {
         "schedule": {

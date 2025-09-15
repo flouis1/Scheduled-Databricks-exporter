@@ -13,321 +13,188 @@ class DatabricksClient {
     this.config = config;
   }
 
-  async createTableIfNotExists(tableName: string, catalog: string, schema: string, axiosClient: any): Promise<void> {
-    try {
-      // Construire le nom de table (complet ou simple selon la configuration)
-      const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
-      const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
-      
-      const createTableStatement = `
-        CREATE TABLE IF NOT EXISTS ${finalTableName} (
-          timestamp STRING,
-          data_json STRING,
-          processed_at TIMESTAMP
-        ) USING DELTA
-        TBLPROPERTIES (
-          'delta.autoOptimize.optimizeWrite' = 'true',
-          'delta.autoOptimize.autoCompact' = 'true'
-        )
-      `;
-
-      console.log(`Creating table if not exists: ${finalTableName}${useFullName ? ` (catalog: ${catalog}, schema: ${schema})` : ' (using default schema)'}`);
-      
-      const response = await axiosClient.post(`${this.config.url}/api/2.0/sql/statements`, {
-        statement: createTableStatement,
-        warehouse_id: this.config.warehouseId
-      }, {
-        headers: {
-          'Authorization': `Bearer ${this.config.token}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      console.log(`Table creation statement executed for ${finalTableName}`, {
-        statementId: response.data.statement_id,
-        useFullName,
-        catalog: useFullName ? catalog : 'default',
-        schema: useFullName ? schema : 'default',
-        tableName
-      });
-    } catch (error) {
-      const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
-      const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
-      console.error(`Failed to create table ${finalTableName}:`, error);
-      throw error;
+  // Validation basique pour éviter l'injection SQL
+  private validateIdentifier(id: string): string {
+    if (!id || !/^[a-zA-Z][a-zA-Z0-9_]*$/.test(id) || id.length > 64) {
+      throw new Error(`Invalid identifier: ${id}`);
     }
+    return id;
   }
 
-  async sendData(data: any[], tableName: string, timestamp: string, axiosClient: any, autoCreateTable: boolean = false, catalog: string = 'main', schema: string = 'default'): Promise<{ recordCount: number; statementId?: string }> {
-    if (!data || data.length === 0) {
-      console.log('No data to send to Databricks');
-      return { recordCount: 0 };
-    }
+  // Échappement sécurisé pour JSON
+  private escapeJson(json: string): string {
+    return json.replace(/\\/g, '\\\\').replace(/'/g, "''").replace(/"/g, '\\"');
+  }
 
-    try {
-      // Create table if auto-create is enabled
-      if (autoCreateTable) {
-        await this.createTableIfNotExists(tableName, catalog, schema, axiosClient);
+  // Exécution avec retry
+  private async executeWithRetry(statement: string, axiosClient: any, retries = 2): Promise<any> {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await axiosClient.post(`${this.config.url}/api/2.0/sql/statements`, {
+          statement, warehouse_id: this.config.warehouseId
+        }, {
+          headers: { 'Authorization': `Bearer ${this.config.token}`, 'Content-Type': 'application/json' }
+        });
+      } catch (error: any) {
+        console.log(`Attempt ${i + 1}/${retries + 1} failed:`, error.message);
+        if (i === retries) throw error;
+        await new Promise(r => setTimeout(r, Math.pow(2, i + 1) * 1000));
       }
-      
-      const statement = this.buildInsertStatement(data, tableName, timestamp, catalog, schema);
-      
-      const response = await axiosClient.post(`${this.config.url}/api/2.0/sql/statements`, {
-        statement,
-        warehouse_id: this.config.warehouseId
-      }, {
-        headers: {
-          'Authorization': `Bearer ${this.config.token}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      console.log(`Data successfully sent to Databricks table ${tableName}`, {
-        statementId: response.data.statement_id,
-        recordCount: data.length
-      });
-
-      return {
-        recordCount: data.length,
-        statementId: response.data.statement_id
-      };
-    } catch (error) {
-      console.error('Failed to send data to Databricks:', error);
-      throw error;
     }
   }
 
-  private buildInsertStatement(data: any[], tableName: string, timestamp: string, catalog: string = 'main', schema: string = 'default'): string {
-    // Create a flexible insert statement that can handle any JSON structure
-    const values = data.map(item => {
-      const jsonData = typeof item === 'string' ? item : JSON.stringify(item);
-      const escapedJson = jsonData.replace(/'/g, "''");
-      return `('${timestamp}', '${escapedJson}', CURRENT_TIMESTAMP())`;
-    }).join(', ');
+  async createTableIfNotExists(tableName: string, catalog: string, schema: string, axiosClient: any): Promise<void> {
+    const safeTable = this.validateIdentifier(tableName);
+    const safeCatalog = this.validateIdentifier(catalog);
+    const safeSchema = this.validateIdentifier(schema);
+    
+    const fullName = `${safeCatalog}.${safeSchema}.${safeTable}`;
+    const sql = `CREATE TABLE IF NOT EXISTS ${fullName} (timestamp STRING, data_json STRING, processed_at TIMESTAMP) USING DELTA`;
+    
+    await this.executeWithRetry(sql, axiosClient);
+    console.log(`Table ${fullName} created/verified`);
+  }
 
-    // Construire le nom de table (complet ou simple selon la configuration)
-    const useFullName = catalog && schema && catalog.trim() !== '' && schema.trim() !== '';
-    const finalTableName = useFullName ? `${catalog}.${schema}.${tableName}` : tableName;
+  async sendData(data: any[], tableName: string, timestamp: string, axiosClient: any, autoCreateTable: boolean = false, catalog: string = 'solengeu', schema: string = 'default', mode: string = 'append'): Promise<{ recordCount: number; statementId?: string }> {
+    if (!data?.length) return { recordCount: 0 };
 
-    return `
-      INSERT INTO ${finalTableName} (
-        timestamp,
-        data_json,
-        processed_at
-      ) VALUES ${values}
-    `;
+    const safeTable = this.validateIdentifier(tableName);
+    const safeCatalog = this.validateIdentifier(catalog);
+    const safeSchema = this.validateIdentifier(schema);
+    const fullName = `${safeCatalog}.${safeSchema}.${safeTable}`;
+
+    console.log(`Sending ${data.length} records to ${fullName} (mode: ${mode})`);
+
+    if (autoCreateTable) {
+      await this.createTableIfNotExists(tableName, catalog, schema, axiosClient);
+    }
+
+    if (mode === 'overwrite') {
+      await this.executeWithRetry(`DELETE FROM ${fullName}`, axiosClient);
+      console.log(`Table cleared for overwrite`);
+    }
+
+    // Insertion par batch pour éviter les requêtes trop longues
+    const batchSize = 10;
+    for (let i = 0; i < data.length; i += batchSize) {
+      const batch = data.slice(i, i + batchSize);
+      const values = batch.map((item, idx) => {
+        const jsonData = typeof item === 'string' ? item : JSON.stringify(item);
+        const safeJson = this.escapeJson(jsonData);
+        const ts = new Date(Date.now() + i + idx).toISOString();
+        return `('${ts}', '${safeJson}', CURRENT_TIMESTAMP())`;
+      }).join(', ');
+
+      const sql = `INSERT INTO ${fullName} (timestamp, data_json, processed_at) VALUES ${values}`;
+      await this.executeWithRetry(sql, axiosClient);
+    }
+
+    console.log(`Successfully inserted ${data.length} records`);
+    return { recordCount: data.length };
   }
 }
 
 function extractDataFromResponse(response: any, dataProperty?: string): any[] {
-  if (!dataProperty) {
-    // If no property specified, try to return the response as array or wrap it
-    if (Array.isArray(response)) {
-      return response;
-    }
-    return [response];
+  if (!dataProperty) return Array.isArray(response) ? response : [response];
+  const keys = dataProperty.split('.');
+  let data = response;
+  for (const key of keys) {
+    if (data?.[key]) data = data[key];
+    else return [];
   }
-
-  // Navigate to the specified property using dot notation
-  const properties = dataProperty.split('.');
-  let current = response;
-  
-  for (const prop of properties) {
-    if (current && typeof current === 'object' && prop in current) {
-      current = current[prop];
-    } else {
-      console.warn(`Property path '${dataProperty}' not found in response`);
-      return [response];
-    }
-  }
-
-  return Array.isArray(current) ? current : [current];
+  return Array.isArray(data) ? data : [data];
 }
 
-function parseJsonString(jsonStr?: string): any {
-  if (!jsonStr || jsonStr.trim() === '') {
-    return {};
-  }
-  try {
-    return JSON.parse(jsonStr);
-  } catch (error) {
-    console.warn(`Failed to parse JSON string: ${jsonStr}`, error);
-    return {};
-  }
+function parseJsonString(jsonStr: string): any {
+  if (!jsonStr?.trim()) return {};
+  try { return JSON.parse(jsonStr); } catch { return {}; }
 }
 
-export default async (
-  context: PlatformContext,
-  request: ScheduledEventRequest
-): Promise<ScheduledEventResponse> => {
+export default async (context: PlatformContext, request: ScheduledEventRequest): Promise<ScheduledEventResponse> => {
   const startTime = Date.now();
   const timestamp = new Date().toISOString();
 
   try {
-    console.log(`SCHEDULED_EVENT triggered with ID: ${request.triggerID}`);
-
-    // Get configuration from worker properties - try multiple access methods
-    const contextWithProps = context as any;
-    
-    // Helper function to safely get properties - try different access patterns
-    const getProperty = (key: string, defaultValue: string = ''): string => {
+    const ctx = context as any;
+    const getProperty = (key: string, defaultValue = '') => {
       try {
-        // Try different ways to access properties for SCHEDULED_EVENT workers
-        let value;
-        
-        // Method 1: context.properties.get()
-        if (contextWithProps.properties?.get) {
-          value = contextWithProps.properties.get(key);
-        }
-        
-        // Method 2: Direct property access
-        if ((value === null || value === undefined) && contextWithProps.properties) {
-          value = contextWithProps.properties[key];
-        }
-        
-        // Method 3: Worker config properties
-        if ((value === null || value === undefined) && contextWithProps.workerConfig?.properties) {
-          value = contextWithProps.workerConfig.properties[key];
-        }
-        
-        // Method 4: Configuration properties
-        if ((value === null || value === undefined) && contextWithProps.config?.properties) {
-          value = contextWithProps.config.properties[key];
-        }
-        
-        return value !== null && value !== undefined ? String(value) : defaultValue;
-      } catch (error) {
-        console.warn(`Failed to get property '${key}':`, error);
-        return defaultValue;
-      }
+        return String(ctx.properties?.get?.(key) || ctx.properties?.[key] || ctx.workerConfig?.properties?.[key] || ctx.config?.properties?.[key] || defaultValue);
+      } catch { return defaultValue; }
     };
     
     const apiEndpoint = getProperty('apiEndpoint');
     const httpMethod = getProperty('httpMethod', 'GET');
-    const queryParamsStr = getProperty('queryParams', '');
-    const headersStr = getProperty('headers', '');
-    const requestBodyStr = getProperty('requestBody', '');
-     const databricksTableName = getProperty('databricksTableName');
-     const dataProperty = getProperty('dataProperty');
-     const autoCreateTable = getProperty('databricksAutoCreateTable', 'false') === 'true';
-     const databricksCatalog = getProperty('databricksCatalog', 'main');
-     const databricksSchema = getProperty('databricksSchema', 'default');
+    const databricksTableName = getProperty('databricksTableName');
+    const dataProperty = getProperty('dataProperty');
+    const autoCreateTable = getProperty('databricksAutoCreateTable', 'false') === 'true';
+    const databricksCatalog = getProperty('databricksCatalog', 'solengeu').toLowerCase();
+    const databricksSchema = getProperty('databricksSchema', 'default').toLowerCase();
+    const databricksMode = getProperty('databricksMode', 'append').toLowerCase();
     
-    // Log loaded properties
-    console.log('Worker properties loaded:', {
-      apiEndpoint,
-      httpMethod,
-      queryParamsStr: queryParamsStr ? 'configured' : 'empty',
-      databricksTableName,
-      dataProperty,
-      autoCreateTable,
-      databricksCatalog,
-      databricksSchema
-    });
+    console.log(`Worker started - Table: ${databricksTableName}, Catalog: ${databricksCatalog}`);
     
-    if (!apiEndpoint) {
-      throw new Error('apiEndpoint property is required in worker configuration');
-    }
+    if (!apiEndpoint) throw new Error('apiEndpoint required');
 
-    console.log(`Starting API call to: ${apiEndpoint}`);
-
-    // Prepare request configuration
-    const method = httpMethod as 'GET' | 'POST' | 'PUT' | 'DELETE';
-    const headers = parseJsonString(headersStr);
+    const queryParams = parseJsonString(getProperty('queryParams'));
+    const headers = parseJsonString(getProperty('headers'));
+    const requestBody = parseJsonString(getProperty('requestBody'));
     
-    // Build query string if provided
-    let url = apiEndpoint;
-    const queryParams = parseJsonString(queryParamsStr);
-    if (queryParams && Object.keys(queryParams).length > 0) {
-      const queryString = new URLSearchParams(queryParams).toString();
-      url += (url.includes('?') ? '&' : '?') + queryString;
-    }
-
-    // Parse request body if provided
-    const requestBody = requestBodyStr ? parseJsonString(requestBodyStr) : undefined;
-
-    // Make API call using platform HTTP client
     let apiResponse;
     
-    switch (method) {
-      case 'GET':
-        apiResponse = await context.clients.platformHttp.get(url, { headers });
-        break;
-      case 'POST':
-        apiResponse = await context.clients.platformHttp.post(url, requestBody, { headers });
-        break;
-      case 'PUT':
-        apiResponse = await context.clients.platformHttp.put(url, requestBody, { headers });
-        break;
-      case 'DELETE':
-        apiResponse = await context.clients.platformHttp.delete(url, { headers });
-        break;
-      default:
-        throw new Error(`Unsupported HTTP method: ${method}`);
-    }
-
-    if (apiResponse.status >= 200 && apiResponse.status < 300) {
-      console.log(`API call successful. Status: ${apiResponse.status}`);
-
-      // Send to Databricks if configured
-      if (databricksTableName) {
-        // Access secrets through official JFrog Workers API
-        const databricksUrl = context.secrets.get('DATABRICKS_URL');
-        const databricksToken = context.secrets.get('DATABRICKS_TOKEN');
-        const databricksWarehouseId = context.secrets.get('DATABRICKS_WAREHOUSE_ID');
-
-        if (!databricksUrl) {
-          console.log('DATABRICKS_URL not configured, skipping Databricks integration');
-        } else if (!databricksToken) {
-          throw new Error('DATABRICKS_TOKEN is required when DATABRICKS_URL is configured');
-        } else {
-          console.log('Sending data to Databricks');
-          
-          const databricksClient = new DatabricksClient({
-            url: databricksUrl,
-            token: databricksToken,
-            warehouseId: databricksWarehouseId
-          });
-
-          const dataToSend = extractDataFromResponse(
-            apiResponse.data, 
-            dataProperty
-          );
-
-          const result = await databricksClient.sendData(
-            dataToSend,
-            databricksTableName,
-            timestamp,
-            context.clients.axios,
-            autoCreateTable,
-            databricksCatalog,
-            databricksSchema
-          );
-
-          const executionTime = Date.now() - startTime;
-          return {
-            message: `Successfully processed ${result.recordCount} records from ${apiEndpoint} and sent to Databricks table ${databricksTableName} in ${executionTime}ms`
-          };
-        }
+    // Construire l'URL avec les paramètres de requête pour GET
+    let finalEndpoint = apiEndpoint;
+    if (httpMethod.toUpperCase() === 'GET' && Object.keys(queryParams).length > 0) {
+      const urlParams = new URLSearchParams();
+      for (const [key, value] of Object.entries(queryParams)) {
+        urlParams.append(key, String(value));
       }
-
-      const executionTime = Date.now() - startTime;
-      const recordCount = Array.isArray(apiResponse.data) ? apiResponse.data.length : 1;
-      
-      return {
-        message: `Successfully processed ${recordCount} records from ${apiEndpoint} in ${executionTime}ms`
-      };
+      finalEndpoint = `${apiEndpoint}?${urlParams.toString()}`;
+    }
+    
+    console.log(`Making ${httpMethod} request to: ${finalEndpoint}`);
+    
+    if (httpMethod.toUpperCase() === 'GET') {
+      apiResponse = await context.clients.platformHttp.get(finalEndpoint, headers);
+    } else if (httpMethod.toUpperCase() === 'POST') {
+      apiResponse = await context.clients.platformHttp.post(apiEndpoint, requestBody, headers);
+    } else if (httpMethod.toUpperCase() === 'PUT') {
+      apiResponse = await context.clients.platformHttp.put(apiEndpoint, requestBody, headers);
+    } else if (httpMethod.toUpperCase() === 'DELETE') {
+      apiResponse = await context.clients.platformHttp.delete(apiEndpoint, headers);
     } else {
-      throw new Error(`API request returned status ${apiResponse.status}: ${apiResponse.statusText}`);
+      throw new Error(`Unsupported HTTP method: ${httpMethod}`);
     }
 
+    console.log(`API call successful, status: ${apiResponse.status}`);
+
+    if (databricksTableName) {
+      const databricksUrl = context.secrets.get('DATABRICKS_URL');
+      const databricksToken = context.secrets.get('DATABRICKS_TOKEN');
+      const databricksWarehouseId = context.secrets.get('DATABRICKS_WAREHOUSE_ID');
+
+      if (!databricksUrl) {
+        console.log('DATABRICKS_URL not configured, skipping Databricks integration');
+      } else if (!databricksToken) {
+        throw new Error('DATABRICKS_TOKEN required when DATABRICKS_URL configured');
+      } else {
+        console.log('Databricks configured, sending data...');
+        
+        const client = new DatabricksClient({ url: databricksUrl, token: databricksToken, warehouseId: databricksWarehouseId });
+        const dataToSend = extractDataFromResponse(apiResponse.data, dataProperty);
+        
+        // Enrichir avec execution_id unique
+        const executionId = Math.random().toString(36).substring(2, 15);
+        const enrichedData = dataToSend.map((item, index) => ({ ...item, execution_id: executionId, execution_timestamp: timestamp, item_index: index }));
+
+        const result = await client.sendData(enrichedData, databricksTableName, timestamp, context.clients.axios, autoCreateTable, databricksCatalog, databricksSchema, databricksMode);
+
+        return { message: `Securely processed ${result.recordCount} records from ${apiEndpoint} to Databricks ${databricksTableName} in ${Date.now() - startTime}ms` };
+      }
+    }
+
+    return { message: `Called ${apiEndpoint} in ${Date.now() - startTime}ms` };
   } catch (error: any) {
-    const executionTime = Date.now() - startTime;
-    const errorMessage = `SCHEDULED_EVENT failed after ${executionTime}ms: ${error.message}`;
-    console.error(errorMessage, error);
-    
-    return {
-      message: errorMessage
-    };
+    console.error('Worker failed:', error.message);
+    return { message: `SCHEDULED_EVENT failed after ${Date.now() - startTime}ms: ${error.message}` };
   }
 };
